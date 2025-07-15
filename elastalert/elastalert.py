@@ -2072,3 +2072,27 @@ class ElastAlerter(object):
         if wait >= rule['exponential_realert']:
             return timestamp + rule['exponential_realert'], exponent - 1
         return timestamp + wait, exponent
+
+
+def handle_signal(signal, frame):
+    elastalert_logger.info('SIGINT received, stopping ElastAlert...')
+    # use os._exit to exit immediately and avoid someone catching SystemExit
+    os._exit(0)
+
+
+def main(args=None):
+    signal.signal(signal.SIGINT, handle_signal)
+    if not args:
+        args = sys.argv[1:]
+    client = ElastAlerter(args)
+
+    if client.prometheus_port and not client.debug:
+        p = PrometheusWrapper(client)
+        p.start()
+
+    if not client.args.silence:
+        client.start()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
