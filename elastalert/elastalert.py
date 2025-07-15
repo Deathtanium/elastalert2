@@ -658,17 +658,14 @@ class ElastAlerter(object):
         try:
             if rule.get('scroll_id') and self.thread_data.num_hits < self.thread_data.total_hits and should_scrolling_continue(rule):
                 if not self.run_query(rule, start, end, scroll=True):
+                    self.cleanup_scroll_id(rule)
                     return False
         except RuntimeError:
             # It's possible to scroll far enough to hit max recursive depth
             pass
-
-        if 'scroll_id' in rule:
-            scroll_id = rule.pop('scroll_id')
-            try:
-                self.thread_data.current_es.clear_scroll(scroll_id=scroll_id)
-            except NotFoundError:
-                pass
+        finally:
+            # Ensure scroll ID is always cleaned up
+            self.cleanup_scroll_id(rule)
 
         return True
 
@@ -1063,6 +1060,8 @@ class ElastAlerter(object):
                 else:
                     continue
                 self.scheduler.remove_job(job_id=rule['name'])
+                # Clean up memory for deleted rule
+                self.cleanup_rule_memory(rule)
                 self.rules.remove(rule)
                 continue
             if hash_value != new_rule_hashes[rule_file]:
@@ -1074,11 +1073,21 @@ class ElastAlerter(object):
                         continue
                     if 'is_enabled' in new_rule and not new_rule['is_enabled']:
                         elastalert_logger.info('Rule file %s is now disabled.' % (rule_file))
+                        # Find and clean up the existing rule
+                        existing_rule = None
+                        for rule in self.rules:
+                            if rule['rule_file'] == rule_file:
+                                existing_rule = rule
+                                break
+                        
                         # Remove this rule if it's been disabled
                         self.rules = [rule for rule in self.rules if rule['rule_file'] != rule_file]
                         # Stop job if is running
                         if self.scheduler.get_job(job_id=new_rule['name']):
                             self.scheduler.remove_job(job_id=new_rule['name'])
+                        # Clean up memory for disabled rule
+                        if existing_rule:
+                            self.cleanup_rule_memory(existing_rule)
                         # Append to disabled_rule
                         for disabled_rule in self.disabled_rules:
                             if disabled_rule['name'] == new_rule['name']:
@@ -1161,6 +1170,11 @@ class ElastAlerter(object):
                                seconds=self.run_every.total_seconds(),
                                id='_internal_handle_config_change',
                                name='Internal: Handle Config Change')
+        # Add memory cleanup job to run every 10 minutes
+        self.scheduler.add_job(self.cleanup_memory_caches, 'interval',
+                               seconds=600,  # 10 minutes
+                               id='_internal_memory_cleanup',
+                               name='Internal: Memory Cache Cleanup')
         self.scheduler.start()
         while self.running:
             next_run = datetime.datetime.now(tz=datetime.UTC) + self.run_every
@@ -1231,6 +1245,9 @@ class ElastAlerter(object):
     def handle_pending_alerts(self):
         self.thread_data.alerts_sent = 0
         self.send_pending_alerts()
+        # Perform periodic memory cleanup
+        self.cleanup_silence_cache()
+        self.cleanup_es_clients_cache()
         elastalert_logger.info("Background alerts thread %s pending alerts sent at %s" % (
             self.thread_data.alerts_sent, pretty_ts(ts_now(), ts_format=self.pretty_ts_format)))
 
@@ -1705,6 +1722,7 @@ class ElastAlerter(object):
                         try:
                             if rule.get('aggregate_by_match_time', False):
                                 match_time = ts_to_dt(lookup_es_key(match, rule['timestamp_field']))
+                               
                                 alert_time = match_time + rule['aggregation']
                             else:
                                 alert_time = ts_now() + rule['aggregation']
@@ -1790,6 +1808,9 @@ class ElastAlerter(object):
         if rule_name in self.silence_cache:
             if ts_now() < self.silence_cache[rule_name][0]:
                 return True
+            else:
+                # Remove expired silence cache entry
+                self.silence_cache.pop(rule_name, None)
 
         if self.debug:
             return False
@@ -1817,6 +1838,105 @@ class ElastAlerter(object):
             if ts_now() < ts_to_dt(until_ts):
                 return True
         return False
+
+    def cleanup_silence_cache(self):
+        """ Remove expired entries from silence cache to prevent memory leaks """
+        now = ts_now()
+        expired_keys = []
+        for rule_name, (until_time, exponent) in self.silence_cache.items():
+            if now >= until_time:
+                expired_keys.append(rule_name)
+        
+        for key in expired_keys:
+            self.silence_cache.pop(key, None)
+        
+        if expired_keys:
+            elastalert_logger.debug(f"Cleaned up {len(expired_keys)} expired silence cache entries")
+
+    def cleanup_es_clients_cache(self):
+        """ Remove elasticsearch clients for rules that no longer exist """
+        active_rule_names = {rule['name'] for rule in self.rules}
+        active_rule_names.update({rule['name'] for rule in self.disabled_rules})
+        
+        stale_clients = []
+        for client_key in self.es_clients.keys():
+            if client_key not in active_rule_names:
+                stale_clients.append(client_key)
+        
+        for key in stale_clients:
+            self.es_clients.pop(key, None)
+        
+        if stale_clients:
+            elastalert_logger.debug(f"Cleaned up {len(stale_clients)} stale elasticsearch client entries")
+
+    def cleanup_rule_memory(self, rule):
+        """ Clean up rule-specific memory allocations to prevent memory leaks """
+        try:
+            # Clean up processed_hits that are older than buffer_time
+            self.remove_old_events(rule)
+            
+            # Clean up expired aggregate alert times
+            if 'aggregate_alert_time' in rule:
+                now = ts_now()
+                expired_keys = []
+                for key, alert_time in rule['aggregate_alert_time'].items():
+                    if now > alert_time:
+                        expired_keys.append(key)
+                
+                for key in expired_keys:
+                    rule['aggregate_alert_time'].pop(key, None)
+                    # Also clean up corresponding current_aggregate_id entries
+                    rule['current_aggregate_id'].pop(key, None)
+                
+                if expired_keys:
+                    elastalert_logger.debug(f"Cleaned up {len(expired_keys)} expired aggregate alert times for rule {rule['name']}")
+            
+            # Clean up rule type specific garbage collection
+            if hasattr(rule.get('type'), 'garbage_collect'):
+                rule['type'].garbage_collect(now)
+                
+        except Exception as e:
+            elastalert_logger.error(f"Error cleaning up memory for rule {rule.get('name', 'unknown')}: {e}")
+
+    def cleanup_expired_aggregates(self):
+        """ Clean up expired aggregate alert times from rules """
+        now = ts_now()
+        cleaned_count = 0
+        
+        for rule in self.rules:
+            if 'aggregate_alert_time' in rule:
+                expired_keys = []
+                for agg_key, alert_time in rule['aggregate_alert_time'].items():
+                    if now > alert_time:
+                        expired_keys.append(agg_key)
+                
+                for key in expired_keys:
+                    rule['aggregate_alert_time'].pop(key, None)
+                    rule['current_aggregate_id'].pop(key, None)
+                    cleaned_count += 1
+        
+        if cleaned_count > 0:
+            elastalert_logger.debug(f"Cleaned up {cleaned_count} expired aggregate alert time entries")
+
+    def cleanup_memory_caches(self):
+        """ Perform periodic cleanup of memory caches to prevent memory leaks """
+        self.cleanup_silence_cache()
+        self.cleanup_es_clients_cache()
+        self.cleanup_expired_aggregates()
+        # Clean up old processed hits for all rules to prevent unbounded growth
+        for rule in self.rules:
+            self.remove_old_events(rule)
+
+    def cleanup_scroll_id(self, rule):
+        """ Safely clean up scroll ID from rule and elasticsearch """
+        if 'scroll_id' in rule:
+            scroll_id = rule.pop('scroll_id')
+            try:
+                if hasattr(self.thread_data, 'current_es') and self.thread_data.current_es:
+                    self.thread_data.current_es.clear_scroll(scroll_id=scroll_id)
+            except (NotFoundError, AttributeError, ElasticsearchException):
+                # Scroll might have already expired or client might not be available
+                pass
 
     def handle_notify_error(self, message, rule, exception=None):
         if self.notify_email:
@@ -1856,6 +1976,8 @@ class ElastAlerter(object):
             self.rules = [running_rule for running_rule in self.rules if running_rule['name'] != rule['name']]
             self.disabled_rules.append(rule)
             self.scheduler.pause_job(job_id=rule['name'])
+            # Clean up rule memory when disabling
+            self.cleanup_rule_memory(rule)
             elastalert_logger.info('Rule %s disabled', rule['name'])
         self.handle_notify_error(msg, rule, exception=exception)
 
@@ -1950,27 +2072,3 @@ class ElastAlerter(object):
         if wait >= rule['exponential_realert']:
             return timestamp + rule['exponential_realert'], exponent - 1
         return timestamp + wait, exponent
-
-
-def handle_signal(signal, frame):
-    elastalert_logger.info('SIGINT received, stopping ElastAlert...')
-    # use os._exit to exit immediately and avoid someone catching SystemExit
-    os._exit(0)
-
-
-def main(args=None):
-    signal.signal(signal.SIGINT, handle_signal)
-    if not args:
-        args = sys.argv[1:]
-    client = ElastAlerter(args)
-
-    if client.prometheus_port and not client.debug:
-        p = PrometheusWrapper(client)
-        p.start()
-
-    if not client.args.silence:
-        client.start()
-
-
-if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
